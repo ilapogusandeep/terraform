@@ -11,6 +11,34 @@ import (
 	"golang.org/x/crypto/openpgp"
 )
 
+const (
+	PackageAuthenticationTypeChecksum  = "authenticated"
+	PackageAuthenticationTypeCommunity = "Community"
+	PackageAuthenticationTypePartner   = "Partner"
+	PackageAuthenticationTypeOfficial  = "Official"
+)
+
+type PackageAuthenticationType struct {
+	Type string
+}
+
+func (t *PackageAuthenticationType) String() string {
+	if t == nil {
+		return "unauthenticated"
+	}
+	return t.Type
+}
+
+func (t *PackageAuthenticationType) Warning() string {
+	if t == nil {
+		return ""
+	}
+	if t.Type == PackageAuthenticationTypeCommunity {
+		return "Warning: Community providers are not trusted by HashiCorp. Use at your own risk."
+	}
+	return ""
+}
+
 // PackageAuthentication is an interface implemented by the optional package
 // authentication implementations a source may include on its PackageMeta
 // objects.
@@ -27,7 +55,7 @@ type PackageAuthentication interface {
 	//
 	// The localLocation is guaranteed not to be a PackageHTTPURL: a
 	// remote package will always be staged locally for inspection first.
-	AuthenticatePackage(meta PackageMeta, localLocation PackageLocation) error
+	AuthenticatePackage(meta PackageMeta, localLocation PackageLocation) (*PackageAuthenticationType, error)
 }
 
 type packageAuthenticationAll []PackageAuthentication
@@ -41,14 +69,16 @@ func PackageAuthenticationAll(checks ...PackageAuthentication) PackageAuthentica
 	return packageAuthenticationAll(checks)
 }
 
-func (checks packageAuthenticationAll) AuthenticatePackage(meta PackageMeta, localLocation PackageLocation) error {
+func (checks packageAuthenticationAll) AuthenticatePackage(meta PackageMeta, localLocation PackageLocation) (*PackageAuthenticationType, error) {
+	var authType *PackageAuthenticationType
 	for _, check := range checks {
-		err := check.AuthenticatePackage(meta, localLocation)
+		var err error
+		authType, err = check.AuthenticatePackage(meta, localLocation)
 		if err != nil {
-			return err
+			return authType, err
 		}
 	}
-	return nil
+	return authType, nil
 }
 
 type archiveHashAuthentication struct {
@@ -68,31 +98,72 @@ func NewArchiveChecksumAuthentication(wantSHA256Sum [sha256.Size]byte) PackageAu
 	return archiveHashAuthentication{wantSHA256Sum}
 }
 
-func (a archiveHashAuthentication) AuthenticatePackage(meta PackageMeta, localLocation PackageLocation) error {
+func (a archiveHashAuthentication) AuthenticatePackage(meta PackageMeta, localLocation PackageLocation) (*PackageAuthenticationType, error) {
 	archiveLocation, ok := localLocation.(PackageLocalArchive)
 	if !ok {
 		// A source should not use this authentication type for non-archive
 		// locations.
-		return fmt.Errorf("cannot check archive hash for non-archive location %s", localLocation)
+		return nil, fmt.Errorf("cannot check archive hash for non-archive location %s", localLocation)
 	}
 
 	f, err := os.Open(string(archiveLocation))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 
 	h := sha256.New()
 	_, err = io.Copy(h, f)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	gotHash := h.Sum(nil)
 	if !bytes.Equal(gotHash, a.WantSHA256Sum[:]) {
-		return fmt.Errorf("archive has incorrect SHA-256 checksum %x (expected %x)", gotHash, a.WantSHA256Sum[:])
+		return nil, fmt.Errorf("archive has incorrect SHA-256 checksum %x (expected %x)", gotHash, a.WantSHA256Sum[:])
 	}
-	return nil
+	return &PackageAuthenticationType{PackageAuthenticationTypeChecksum}, nil
+}
+
+type matchingChecksumAuthentication struct {
+	Document      []byte
+	Filename      string
+	WantSHA256Sum [sha256.Size]byte
+}
+
+// NewMatchingChecksumAuthentication FIXME
+func NewMatchingChecksumAuthentication(document []byte, filename string, wantSHA256Sum [sha256.Size]byte) PackageAuthentication {
+	return matchingChecksumAuthentication{
+		Document:      document,
+		Filename:      filename,
+		WantSHA256Sum: wantSHA256Sum,
+	}
+}
+
+func (m matchingChecksumAuthentication) AuthenticatePackage(meta PackageMeta, location PackageLocation) (*PackageAuthenticationType, error) {
+	if _, ok := meta.Location.(PackageHTTPURL); !ok {
+		// A source should not use this authentication type for non-HTTP
+		// source locations.
+		return nil, fmt.Errorf("cannot verify matching checksum for non-HTTP location %s", meta.Location)
+	}
+
+	filename := []byte(m.Filename)
+	var gotSHA256Sum []byte
+	for _, line := range bytes.Split(m.Document, []byte("\n")) {
+		parts := bytes.Fields(line)
+		if len(parts) > 1 && bytes.Equal(parts[1], filename) {
+			gotSHA256Sum = parts[0]
+			break
+		}
+	}
+
+	if bytes.Equal(gotSHA256Sum, m.WantSHA256Sum[:]) {
+		return &PackageAuthenticationType{PackageAuthenticationTypeChecksum}, nil
+	} else if gotSHA256Sum != nil {
+		return nil, fmt.Errorf("checksum list has unexpected SHA-256 hash %x (expected %x)", gotSHA256Sum, m.WantSHA256Sum[:])
+	} else {
+		return nil, fmt.Errorf("checksum list has no SHA-256 hash for %q", m.Filename)
+	}
 }
 
 type signatureAuthentication struct {
@@ -111,63 +182,43 @@ func NewSignatureAuthentication(document, signature []byte, key string) PackageA
 	}
 }
 
-func (s signatureAuthentication) AuthenticatePackage(meta PackageMeta, location PackageLocation) error {
+func (s signatureAuthentication) AuthenticatePackage(meta PackageMeta, location PackageLocation) (*PackageAuthenticationType, error) {
 	if _, ok := location.(PackageLocalArchive); !ok {
 		// A source should not use this authentication type for non-archive
 		// locations.
-		return fmt.Errorf("cannot check archive hash for non-archive location %s", location)
+		return nil, fmt.Errorf("cannot check archive hash for non-archive location %s", location)
 	}
 
 	if _, ok := location.(PackageHTTPURL); !ok {
 		// A source should not use this authentication type for non-HTTP
 		// locations.
-		return fmt.Errorf("cannot check archive hash for non-HTTP location %s", meta.Location)
+		return nil, fmt.Errorf("cannot check archive hash for non-HTTP location %s", meta.Location)
 	}
 
+	// Verify the signature using the author keyring from the registry.
 	el, err := openpgp.ReadArmoredKeyRing(strings.NewReader(s.Key))
 	if err != nil {
-		return err
+		return nil, err
 	}
-
 	_, err = openpgp.CheckDetachedSignature(el, bytes.NewReader(s.Document), bytes.NewReader(s.Signature))
-
-	return err
-}
-
-type matchingChecksumAuthentication struct {
-	Document      []byte
-	Filename      string
-	WantSHA256Sum [sha256.Size]byte
-}
-
-// NewMatchingChecksumAuthentication FIXME
-func NewMatchingChecksumAuthentication(document []byte, filename string, wantSHA256Sum [sha256.Size]byte) PackageAuthentication {
-	return matchingChecksumAuthentication{
-		Document:      document,
-		Filename:      filename,
-		WantSHA256Sum: wantSHA256Sum,
-	}
-}
-
-func (m matchingChecksumAuthentication) AuthenticatePackage(meta PackageMeta, location PackageLocation) error {
-	if _, ok := meta.Location.(PackageHTTPURL); !ok {
-		// A source should not use this authentication type for non-HTTP
-		// source locations.
-		return fmt.Errorf("cannot verify matching checksum for non-HTTP location %s", meta.Location)
+	if err != nil {
+		return nil, err
 	}
 
-	filename := []byte(m.Filename)
-	for _, line := range bytes.Split(m.Document, []byte("\n")) {
-		parts := bytes.Fields(line)
-		if len(parts) > 1 && bytes.Equal(parts[1], filename) {
-			gotSHA256Sum := parts[0]
-			if bytes.Equal(gotSHA256Sum, m.WantSHA256Sum[:]) {
-				return nil
-			} else {
-				return fmt.Errorf("checksum list has unexpected SHA-256 hash %x (expected %x)", gotSHA256Sum, m.WantSHA256Sum[:])
-			}
-		}
+	// Verify the signature using the HashiCorp public key. If this succeeds,
+	// this is an official provider.
+	hashicorpEntityList, err := openpgp.ReadArmoredKeyRing(strings.NewReader(HashicorpPublicKey))
+	if err != nil {
+		return nil, err
+	}
+	_, err = openpgp.CheckDetachedSignature(hashicorpEntityList, bytes.NewReader(s.Document), bytes.NewReader(s.Signature))
+	if err == nil {
+		return &PackageAuthenticationType{PackageAuthenticationTypeOfficial}, nil
 	}
 
-	return fmt.Errorf("checksum list has no SHA-256 hash for %q", m.Filename)
+	// FIXME: trusted partners go here
+
+	// We have a valid signature, but it's not from the HashiCorp key, and it
+	// also isn't a trusted partner. This is a community provider.
+	return &PackageAuthenticationType{PackageAuthenticationTypeCommunity}, nil
 }

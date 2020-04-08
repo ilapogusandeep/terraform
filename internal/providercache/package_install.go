@@ -22,7 +22,7 @@ import (
 // specific protocol and set of expectations.)
 var unzip = getter.ZipDecompressor{}
 
-func installFromHTTPURL(ctx context.Context, meta getproviders.PackageMeta, targetDir string) error {
+func installFromHTTPURL(ctx context.Context, meta getproviders.PackageMeta, targetDir string) (*getproviders.PackageAuthenticationType, error) {
 	url := meta.Location.String()
 
 	// When we're installing from an HTTP URL we expect the URL to refer to
@@ -50,7 +50,7 @@ func installFromHTTPURL(ctx context.Context, meta getproviders.PackageMeta, targ
 
 	f, err := ioutil.TempFile("", "terraform-provider")
 	if err != nil {
-		return fmt.Errorf("failed to open temporary file to download from %s", url)
+		return nil, fmt.Errorf("failed to open temporary file to download from %s", url)
 	}
 	defer f.Close()
 
@@ -61,15 +61,15 @@ func installFromHTTPURL(ctx context.Context, meta getproviders.PackageMeta, targ
 		err = fmt.Errorf("incorrect response size: expected %d bytes, but got %d bytes", resp.ContentLength, n)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	archiveFilename := f.Name()
 	localLocation := getproviders.PackageLocalArchive(archiveFilename)
 
 	if meta.Authentication != nil {
-		if err := meta.Authentication.AuthenticatePackage(meta, localLocation); err != nil {
-			return err
+		if authType, err := meta.Authentication.AuthenticatePackage(meta, localLocation); err != nil {
+			return nil, err
 		}
 	}
 
@@ -85,34 +85,44 @@ func installFromHTTPURL(ctx context.Context, meta getproviders.PackageMeta, targ
 		Location:         localLocation,
 		Authentication:   nil,
 	}
-	return installFromLocalArchive(ctx, localMeta, targetDir)
+	if _, err := installFromLocalArchive(ctx, localMeta, targetDir); err != nil {
+		return nil, err
+	}
+	return &getproviders.PackageAuthenticationType{authType}, nil
 }
 
-func installFromLocalArchive(ctx context.Context, meta getproviders.PackageMeta, targetDir string) error {
+func installFromLocalArchive(ctx context.Context, meta getproviders.PackageMeta, targetDir string) (*getproviders.PackageAuthenticationType, error) {
+	var authType *getproviders.PackageAuthenticationType
 	if meta.Authentication != nil {
-		if err := meta.Authentication.AuthenticatePackage(meta, meta.Location); err != nil {
-			return err
+		var err error
+		if authType, err = meta.Authentication.AuthenticatePackage(meta, meta.Location); err != nil {
+			return nil, err
 		}
 	}
 	filename := meta.Location.String()
 
-	return unzip.Decompress(targetDir, filename, true)
+	err := unzip.Decompress(targetDir, filename, true)
+	if err != nil {
+		return authType, err
+	}
+
+	return authType, nil
 }
 
 // installFromLocalDir is the implementation of both installing a package from
 // a local directory source _and_ of linking a package from another cache
 // in LinkFromOtherCache, because they both do fundamentally the same
 // operation: symlink if possible, or deep-copy otherwise.
-func installFromLocalDir(ctx context.Context, meta getproviders.PackageMeta, targetDir string) error {
+func installFromLocalDir(ctx context.Context, meta getproviders.PackageMeta, targetDir string) (*getproviders.PackageAuthenticationType, error) {
 	sourceDir := meta.Location.String()
 
 	absNew, err := filepath.Abs(targetDir)
 	if err != nil {
-		return fmt.Errorf("failed to make target path %s absolute: %s", targetDir, err)
+		return nil, fmt.Errorf("failed to make target path %s absolute: %s", targetDir, err)
 	}
 	absCurrent, err := filepath.Abs(sourceDir)
 	if err != nil {
-		return fmt.Errorf("failed to make source path %s absolute: %s", sourceDir, err)
+		return nil, fmt.Errorf("failed to make source path %s absolute: %s", sourceDir, err)
 	}
 
 	// Before we do anything else, we'll do a quick check to make sure that
@@ -120,15 +130,15 @@ func installFromLocalDir(ctx context.Context, meta getproviders.PackageMeta, tar
 	// disk. This compares the files by their OS-level device and directory
 	// entry identifiers, not by their virtual filesystem paths.
 	if same, err := copydir.SameFile(absNew, absCurrent); same {
-		return fmt.Errorf("cannot install existing provider directory %s to itself", targetDir)
+		return nil, fmt.Errorf("cannot install existing provider directory %s to itself", targetDir)
 	} else if err != nil {
-		return fmt.Errorf("failed to determine if %s and %s are the same: %s", sourceDir, targetDir, err)
+		return nil, fmt.Errorf("failed to determine if %s and %s are the same: %s", sourceDir, targetDir, err)
 	}
 
 	// Delete anything that's already present at this path first.
 	err = os.RemoveAll(targetDir)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove existing %s before linking it to %s: %s", sourceDir, targetDir, err)
+		return nil, fmt.Errorf("failed to remove existing %s before linking it to %s: %s", sourceDir, targetDir, err)
 	}
 
 	// We'll prefer to create a symlink if possible, but we'll fall back to
@@ -147,22 +157,22 @@ func installFromLocalDir(ctx context.Context, meta getproviders.PackageMeta, tar
 	parentDir := filepath.Dir(absNew)
 	err = os.MkdirAll(parentDir, 0755)
 	if err != nil && os.IsExist(err) {
-		return fmt.Errorf("failed to create parent directories leading to %s: %s", targetDir, err)
+		return nil, fmt.Errorf("failed to create parent directories leading to %s: %s", targetDir, err)
 	}
 
 	err = os.Symlink(linkTarget, absNew)
 	if err == nil {
 		// Success, then!
-		return nil
+		return getproviders.PackageAuthenticationTypeUnauthenticated{}, nil
 	}
 
 	// If we get down here then symlinking failed and we need a deep copy
 	// instead.
 	err = copydir.CopyDir(absNew, absCurrent)
 	if err != nil {
-		return fmt.Errorf("failed to either symlink or copy %s to %s: %s", absCurrent, absNew, err)
+		return nil, fmt.Errorf("failed to either symlink or copy %s to %s: %s", absCurrent, absNew, err)
 	}
 
 	// If we got here then apparently our copy succeeded, so we're done.
-	return nil
+	return getproviders.PackageAuthenticationTypeUnauthenticated{}, nil
 }
