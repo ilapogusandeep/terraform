@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/apparentlymart/go-versions/versions"
@@ -172,6 +174,13 @@ func (c *registryClient) PackageMeta(provider addrs.Provider, version Version, t
 		return PackageMeta{}, c.errQueryFailed(provider, errors.New(resp.Status))
 	}
 
+	type SigningKey struct {
+		ASCIIArmor     string `json:"ascii_armor"`
+		TrustSignature string `json:"trust_signature"`
+	}
+	type SigningKeyList struct {
+		SigningKeys []*SigningKey `json:"gpg_public_keys"`
+	}
 	type ResponseBody struct {
 		Protocols   []string `json:"protocols"`
 		OS          string   `json:"os"`
@@ -180,7 +189,10 @@ func (c *registryClient) PackageMeta(provider addrs.Provider, version Version, t
 		DownloadURL string   `json:"download_url"`
 		SHA256Sum   string   `json:"shasum"`
 
-		// TODO: Other metadata for signature checking
+		SHA256SumsURL          string `json:"shasums_url"`
+		SHA256SumsSignatureURL string `json:"shasums_signature_url"`
+
+		SigningKeys SigningKeyList `json:"signing_keys"`
 	}
 	var body ResponseBody
 
@@ -230,6 +242,7 @@ func (c *registryClient) PackageMeta(provider addrs.Provider, version Version, t
 			fmt.Errorf("registry response includes invalid SHA256 hash %q: %s", body.SHA256Sum, err),
 		)
 	}
+
 	var checksum [sha256.Size]byte
 	_, err = hex.Decode(checksum[:], []byte(body.SHA256Sum))
 	if err != nil {
@@ -238,7 +251,49 @@ func (c *registryClient) PackageMeta(provider addrs.Provider, version Version, t
 			fmt.Errorf("registry response includes invalid SHA256 hash %q: %s", body.SHA256Sum, err),
 		)
 	}
-	ret.Authentication = NewArchiveChecksumAuthentication(checksum)
+
+	shasumsURL, err := url.Parse(body.SHA256SumsURL)
+	if err != nil {
+		return PackageMeta{}, fmt.Errorf("registry response includes invalid SHASUMS URL: %s", err)
+	}
+	shasumsURL = resp.Request.URL.ResolveReference(shasumsURL)
+	if shasumsURL.Scheme != "http" && shasumsURL.Scheme != "https" {
+		return PackageMeta{}, fmt.Errorf("registry response includes invalid SHASUMS URL: must use http or https scheme")
+	}
+	document, err := c.getFile(shasumsURL)
+	if err != nil {
+		return PackageMeta{}, c.errQueryFailed(
+			provider,
+			fmt.Errorf("failed to retrieve authentication checksums for provider: %s", err),
+		)
+	}
+	signatureURL, err := url.Parse(body.SHA256SumsSignatureURL)
+	if err != nil {
+		return PackageMeta{}, fmt.Errorf("registry response includes invalid SHASUMS signature URL: %s", err)
+	}
+	signatureURL = resp.Request.URL.ResolveReference(signatureURL)
+	if signatureURL.Scheme != "http" && signatureURL.Scheme != "https" {
+		return PackageMeta{}, fmt.Errorf("registry response includes invalid SHASUMS signature URL: must use http or https scheme")
+	}
+	signature, err := c.getFile(signatureURL)
+	if err != nil {
+		return PackageMeta{}, c.errQueryFailed(
+			provider,
+			fmt.Errorf("failed to retrieve cryptographic signature for provider: %s", err),
+		)
+	}
+
+	var keys []string
+	for _, key := range body.SigningKeys.SigningKeys {
+		keys = append(keys, key.ASCIIArmor)
+	}
+	keyring := strings.Join(keys, "\n")
+
+	ret.Authentication = PackageAuthenticationAll(
+		NewMatchingChecksumAuthentication(document, body.Filename, checksum),
+		NewSignatureAuthentication(document, signature, keyring),
+		NewArchiveChecksumAuthentication(checksum),
+	)
 
 	return ret, nil
 }
@@ -320,4 +375,23 @@ func (c *registryClient) errUnauthorized(hostname svchost.Hostname) error {
 		Hostname:        hostname,
 		HaveCredentials: c.creds != nil,
 	}
+}
+
+func (c *registryClient) getFile(url *url.URL) ([]byte, error) {
+	resp, err := c.httpClient.Get(url.String())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s", resp.Status)
+	}
+
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return data, err
+	}
+
+	return data, nil
 }

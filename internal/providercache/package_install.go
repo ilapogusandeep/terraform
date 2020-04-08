@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/terraform/httpclient"
 	"github.com/hashicorp/terraform/internal/copydir"
+	"github.com/hashicorp/terraform/internal/getproviders"
 )
 
 // We borrow the "unpack a zip file into a target directory" logic from
@@ -21,7 +22,9 @@ import (
 // specific protocol and set of expectations.)
 var unzip = getter.ZipDecompressor{}
 
-func installFromHTTPURL(ctx context.Context, url string, targetDir string) error {
+func installFromHTTPURL(ctx context.Context, meta getproviders.PackageMeta, targetDir string) error {
+	url := meta.Location.String()
+
 	// When we're installing from an HTTP URL we expect the URL to refer to
 	// a zip file. We'll fetch that into a temporary file here and then
 	// delegate to installFromLocalArchive below to actually extract it.
@@ -61,13 +64,38 @@ func installFromHTTPURL(ctx context.Context, url string, targetDir string) error
 		return err
 	}
 
-	// If we managed to download successfully then we can now delegate to
-	// installFromLocalArchive for extraction.
 	archiveFilename := f.Name()
-	return installFromLocalArchive(ctx, archiveFilename, targetDir)
+	localLocation := getproviders.PackageLocalArchive(archiveFilename)
+
+	if meta.Authentication != nil {
+		if err := meta.Authentication.AuthenticatePackage(meta, localLocation); err != nil {
+			return err
+		}
+	}
+
+	// We can now delegate to installFromLocalArchive for extraction. To do so,
+	// we construct a new package meta description using the local archive
+	// path as the location, and skipping authentication.
+	localMeta := getproviders.PackageMeta{
+		Provider:         meta.Provider,
+		Version:          meta.Version,
+		ProtocolVersions: meta.ProtocolVersions,
+		TargetPlatform:   meta.TargetPlatform,
+		Filename:         meta.Filename,
+		Location:         localLocation,
+		Authentication:   nil,
+	}
+	return installFromLocalArchive(ctx, localMeta, targetDir)
 }
 
-func installFromLocalArchive(ctx context.Context, filename string, targetDir string) error {
+func installFromLocalArchive(ctx context.Context, meta getproviders.PackageMeta, targetDir string) error {
+	if meta.Authentication != nil {
+		if err := meta.Authentication.AuthenticatePackage(meta, meta.Location); err != nil {
+			return err
+		}
+	}
+	filename := meta.Location.String()
+
 	return unzip.Decompress(targetDir, filename, true)
 }
 
@@ -75,7 +103,9 @@ func installFromLocalArchive(ctx context.Context, filename string, targetDir str
 // a local directory source _and_ of linking a package from another cache
 // in LinkFromOtherCache, because they both do fundamentally the same
 // operation: symlink if possible, or deep-copy otherwise.
-func installFromLocalDir(ctx context.Context, sourceDir string, targetDir string) error {
+func installFromLocalDir(ctx context.Context, meta getproviders.PackageMeta, targetDir string) error {
+	sourceDir := meta.Location.String()
+
 	absNew, err := filepath.Abs(targetDir)
 	if err != nil {
 		return fmt.Errorf("failed to make target path %s absolute: %s", targetDir, err)

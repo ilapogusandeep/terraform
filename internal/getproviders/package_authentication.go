@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
+
+	"golang.org/x/crypto/openpgp"
 )
 
 // PackageAuthentication is an interface implemented by the optional package
@@ -90,4 +93,81 @@ func (a archiveHashAuthentication) AuthenticatePackage(meta PackageMeta, localLo
 		return fmt.Errorf("archive has incorrect SHA-256 checksum %x (expected %x)", gotHash, a.WantSHA256Sum[:])
 	}
 	return nil
+}
+
+type signatureAuthentication struct {
+	Document  []byte
+	Signature []byte
+	Key       string
+}
+
+// NewSignatureAuthentication returns a PackageAuthentication implementation
+// that verifies the cryptographic signature for a package against a given key.
+func NewSignatureAuthentication(document, signature []byte, key string) PackageAuthentication {
+	return signatureAuthentication{
+		Document:  document,
+		Signature: signature,
+		Key:       key,
+	}
+}
+
+func (s signatureAuthentication) AuthenticatePackage(meta PackageMeta, location PackageLocation) error {
+	if _, ok := location.(PackageLocalArchive); !ok {
+		// A source should not use this authentication type for non-archive
+		// locations.
+		return fmt.Errorf("cannot check archive hash for non-archive location %s", location)
+	}
+
+	if _, ok := location.(PackageHTTPURL); !ok {
+		// A source should not use this authentication type for non-HTTP
+		// locations.
+		return fmt.Errorf("cannot check archive hash for non-HTTP location %s", meta.Location)
+	}
+
+	el, err := openpgp.ReadArmoredKeyRing(strings.NewReader(s.Key))
+	if err != nil {
+		return err
+	}
+
+	_, err = openpgp.CheckDetachedSignature(el, bytes.NewReader(s.Document), bytes.NewReader(s.Signature))
+
+	return err
+}
+
+type matchingChecksumAuthentication struct {
+	Document      []byte
+	Filename      string
+	WantSHA256Sum [sha256.Size]byte
+}
+
+// NewMatchingChecksumAuthentication FIXME
+func NewMatchingChecksumAuthentication(document []byte, filename string, wantSHA256Sum [sha256.Size]byte) PackageAuthentication {
+	return matchingChecksumAuthentication{
+		Document:      document,
+		Filename:      filename,
+		WantSHA256Sum: wantSHA256Sum,
+	}
+}
+
+func (m matchingChecksumAuthentication) AuthenticatePackage(meta PackageMeta, location PackageLocation) error {
+	if _, ok := meta.Location.(PackageHTTPURL); !ok {
+		// A source should not use this authentication type for non-HTTP
+		// source locations.
+		return fmt.Errorf("cannot verify matching checksum for non-HTTP location %s", meta.Location)
+	}
+
+	filename := []byte(m.Filename)
+	for _, line := range bytes.Split(m.Document, []byte("\n")) {
+		parts := bytes.Fields(line)
+		if len(parts) > 1 && bytes.Equal(parts[1], filename) {
+			gotSHA256Sum := parts[0]
+			if bytes.Equal(gotSHA256Sum, m.WantSHA256Sum[:]) {
+				return nil
+			} else {
+				return fmt.Errorf("checksum list has unexpected SHA-256 hash %x (expected %x)", gotSHA256Sum, m.WantSHA256Sum[:])
+			}
+		}
+	}
+
+	return fmt.Errorf("checksum list has no SHA-256 hash for %q", m.Filename)
 }
